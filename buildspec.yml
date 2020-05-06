@@ -1,6 +1,6 @@
 version: 0.2
 phases:
-    build:
+  build:
     commands:
       - dotnet restore
       - dotnet publish -c Release
