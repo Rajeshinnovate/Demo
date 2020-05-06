@@ -7,9 +7,9 @@ phases:
       - cd bin/Release/netcoreapp1.0/publish
       - zip ../../../../MyProject.zip *
       - cd ../../../..
-      - aws cloudformation package --template-file template.yml --s3-bucket $BUCKET --output-template-file output-template.yaml
+      - aws cloudformation package --template-file template.yaml --s3-bucket demo3366 --output-template-file output-template.yaml
 artifacts:
   type: zip
   files:
-    - template.yml
+    - template.yaml
     - output-template.yaml
