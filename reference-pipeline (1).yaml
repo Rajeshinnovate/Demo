@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |-
+    This template creates a Continuous Develiery pipeline for a database using CodePipeline and CodeBuild.
+Parameters:
+  Application:
+    Description: Enter the Application name.
+    Type: String
+  PipelineName:
+    Type: String
+    Description: Name for the Pipeline. Allowed pattern is '[\.\-_A-Za-z0-9]+'.
+    AllowedPattern: '[\.\-_A-Za-z0-9]+'
+  RepoName:
+    Type: String
+    Description: Name of the CodeCommit repo
+  BranchName:
+    Type: String
+    Description: Name of the CodeCommit branch
+    Default: master
+  PollForSourceChanges:
+    Type: String
+    Description: Choose whether you'd like your code to automatically trigger the pipeline.
+    Default: false
+    AllowedValues:
+      - true 
+      - false
+  Environment:
+    Description: Specify the database environment.
+    Type: String
+    Default: 'caas-dev'
+    AllowedValues:
+      - caas-prd
+      - caas-dev
+  ApproverEmail:
+    Description: Enter email address for baseline update approvers.
+    Type: String
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Application Information"
+        Parameters: 
+          - Application
+          - RepoName
+          - BranchName
+          - PipelineName
+          - PollForSourceChanges
+          - Environment
+      - 
+        Label: 
+          default: "Approvers Information"
+        Parameters: 
+          - ApproverEmail
+
+Resources:
+
+  ApproversSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${Application}-${Environment}-base-pipeline-approvers
+      Subscription: 
+        - Endpoint: !Ref ApproverEmail
+          Protocol: email
+      TopicName: !Sub ${Application}-${Environment}-base-pipeline-approvers
+      
+  CfnCheckerProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${PipelineName}-cfn-checker"
+      Description: This build project validates CFN templates syntax and security.
+      ServiceRole: "{{resolve:ssm:/mgmt/iam/codebuildrole/arn:1}}"
+      EncryptionKey: !Sub "{{resolve:ssm:/mgmt/${AWS::Region}/kms/artifactsbucketkey/arn:1}}"
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-app.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      TimeoutInMinutes: 15
+
+  TerminationProtectionBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${PipelineName}-termination-protection"
+      Description: This build project check if TerminationProtections is enabled for all stacks deployed in this pipeline.
+      ServiceRole: "{{resolve:ssm:/mgmt/iam/codebuildrole/arn:1}}"
+      EncryptionKey: !Sub "{{resolve:ssm:/mgmt/${AWS::Region}/kms/artifactsbucketkey/arn:1}}"
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-crossaccount-termination-protection.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      TimeoutInMinutes: 15
+
+  TagsAttacherBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${PipelineName}-tags-attacher"
+      Description: This build project attaches specific tags for all stacks deployed in this pipeline.
+      ServiceRole: "{{resolve:ssm:/mgmt/iam/codebuildrole/arn:1}}"
+      EncryptionKey: !Sub "{{resolve:ssm:/mgmt/${AWS::Region}/kms/artifactsbucketkey/arn:1}}"
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-tags-attacher.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      TimeoutInMinutes: 15
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref PipelineName
+      RoleArn: "{{resolve:ssm:/mgmt/iam/codepipelinerole/arn:1}}"
+      RestartExecutionOnUpdate: false
+      ArtifactStore:
+        Type: S3
+        Location: !Sub "{{resolve:ssm:/mgmt/${AWS::Region}/s3/artifactsbucket/name:1}}"
+        EncryptionKey:
+          Id: !Sub "{{resolve:ssm:/mgmt/${AWS::Region}/kms/artifactsbucketkey/arn:1}}"
+          Type: KMS
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: application-source-code
+              Namespace : ApplicationSource
+              ActionTypeId:
+                Category: Source
+                Version: "1"
+                Provider: GitHub
+                Owner: ThirdParty
+              Configuration:
+                Owner: ckps
+                Repo: !Ref RepoName
+                Branch: !Ref BranchName
+                PollForSourceChanges: !Ref PollForSourceChanges
+                OAuthToken: '{{resolve:secretsmanager:ck1-github-1}}'
+              RunOrder: 1
+              OutputArtifacts:
+                - Name: AppSourceArtifact
+        -
+          Name: Check-Templates
+          Actions:
+            -
+              Name: check-cfn-templates
+              ActionTypeId:
+                Category: Build
+                Version: "1"
+                Provider: CodeBuild
+                Owner: AWS
+              Configuration:
+                ProjectName: !Ref CfnCheckerProject
+                EnvironmentVariables: !Sub '[{"name":"pipeline_name","value":"${PipelineName}","type":"PLAINTEXT"},{"name":"region","value":"${AWS::Region}","type":"PLAINTEXT"},{"name":"s3_bucket","value":"{{resolve:ssm:/mgmt/${AWS::Region}/s3/artifactsbucket/name:1}}","type":"PLAINTEXT"}]'
+              RunOrder: 1
+              InputArtifacts:
+                - Name: AppSourceArtifact
+        -
+          Name: Pre-Deployment-Configuration
+          Actions:
+            - Name: attach-tags
+              ActionTypeId:
+                Category: Build
+                Version: "1"
+                Provider: CodeBuild
+                Owner: AWS
+              Configuration:
+                ProjectName: !Ref TagsAttacherBuildProject
+                EnvironmentVariables: !Sub '[{"name":"pipeline_name","value":"${PipelineName}","type":"PLAINTEXT"},{"name":"region","value":"${AWS::Region}","type":"PLAINTEXT"},{"name":"s3_bucket","value":"{{resolve:ssm:/mgmt/${AWS::Region}/s3/artifactsbucket/name:1}}","type":"PLAINTEXT"}]'
+              RunOrder: 1
+              InputArtifacts:
+                - Name: AppSourceArtifact
+              OutputArtifacts:
+                - Name: DeploymentReadyArtifacts
+        -
+          Name: !Sub 'Deployment-To-${Environment}'
+          Actions:
+            -
+              Name: !Sub request-approval-for-${Environment}
+              ActionTypeId:
+                Category: Approval
+                Version: "1"
+                Provider: Manual
+                Owner: AWS
+              Configuration:
+                NotificationArn: !Ref ApproversSNSTopic
+                CustomData: !Sub 'Accept or Reject the update of base pipeline for ${Application} application to ${Environment} environment'
+              RunOrder: 1
+            -
+              Name: !Sub publish-step1-to-${Environment}
+              ActionTypeId:
+                Category: Deploy
+                Version: "1"
+                Provider: CloudFormation
+                Owner: AWS
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Sub db-publisher-${Application}-step1-${Environment}
+                RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cfn-deployment-r"
+                TemplatePath: DeploymentReadyArtifacts::services/data_step1_key.yaml
+                TemplateConfiguration: !Sub DeploymentReadyArtifacts::parameters/${Application}-step1-key-${Environment}.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: DeploymentReadyArtifacts
+              RunOrder: 2
+              RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cp-deployment-r"
+            -
+              Name: !Sub publish-step2-to-${Environment}
+              ActionTypeId:
+                Category: Deploy
+                Version: "1"
+                Provider: CloudFormation
+                Owner: AWS
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Sub db-publisher-${Application}-step2-${Environment}
+                RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cfn-deployment-r"
+                TemplatePath: DeploymentReadyArtifacts::services/data_step2_id.yaml
+                TemplateConfiguration: !Sub DeploymentReadyArtifacts::parameters/${Application}-step2-key-${Environment}.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: DeploymentReadyArtifacts
+              RunOrder: 3
+              RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cp-deployment-r"
+            -
+              Name: !Sub publish-step3-to-${Environment}
+              ActionTypeId:
+                Category: Deploy
+                Version: "1"
+                Provider: CloudFormation
+                Owner: AWS
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Sub db-publisher-${Application}-step3-${Environment}
+                RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cfn-deployment-r"
+                TemplatePath: DeploymentReadyArtifacts::services/data_step3_resourceattachments.yaml
+                TemplateConfiguration: !Sub DeploymentReadyArtifacts::parameters/${Application}-step3-key-${Environment}.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: DeploymentReadyArtifacts
+              RunOrder: 4
+              RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cp-deployment-r"
+            -
+              Name: !Sub publish-step4-to-${Environment}
+              ActionTypeId:
+                Category: Deploy
+                Version: "1"
+                Provider: CloudFormation
+                Owner: AWS
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Sub db-publisher-${Application}-step4-${Environment}
+                RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cfn-deployment-r"
+                TemplatePath: DeploymentReadyArtifacts::services/data_step4_policies.yaml
+                TemplateConfiguration: !Sub DeploymentReadyArtifacts::parameters/${Application}-step4-key-${Environment}.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: DeploymentReadyArtifacts
+              RunOrder: 5
+              RoleArn: !Sub "arn:aws:iam::{{resolve:ssm:/${Environment}/account/id:1}}:role/ck-devops-cp-deployment-r"
+        -
+          Name: Post-Deployment-Configuration
+          Actions:
+            - Name: config-termination-protection
+              ActionTypeId:
+                Category: Build
+                Version: "1"
+                Provider: CodeBuild
+                Owner: AWS
+              Configuration:
+                ProjectName: !Ref TerminationProtectionBuildProject
+                EnvironmentVariables: !Sub '[{"name":"pipeline_name","value":"${PipelineName}","type":"PLAINTEXT"},{"name":"region","value":"${AWS::Region}","type":"PLAINTEXT"},{"name":"cross_account","value":"True","type":"PLAINTEXT"},{"name":"account_id","value":"{{resolve:ssm:/${Environment}/account/id:1}}","type":"PLAINTEXT"},{"name":"s3_bucket","value":"{{resolve:ssm:/mgmt/${AWS::Region}/s3/artifactsbucket/name:1}}","type":"PLAINTEXT"}]'
+              RunOrder: 1
+              InputArtifacts:
+                - Name: DeploymentReadyArtifacts

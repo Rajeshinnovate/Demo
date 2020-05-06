@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::Serverless-2016-10-31'
+Description: '{env}-sls-{project_name}'
+Parameters: {}
+Conditions: {}
+Globals:
+  Api:
+    Cors:
+      AllowHeaders: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'''
+      AllowMethods: '''*'''
+      AllowOrigin: '''*'''
+    EndpointConfiguration: REGIONAL
+Resources:
+  RequestLoggingBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '{env}-rl-${AWS::Region}-${AWS::AccountId}-6ea16bf8f4614f78876526412'
+      VersioningConfiguration:
+        Status: Enabled
+    DeletionPolicy: Retain
+  RequestLoggingQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'ck-{env}-{project_name}'
+  RequestLoggingQueuePolicy:
+    Type: 'AWS::SQS::QueuePolicy'
+    Properties:
+      Queues:
+        - !Ref RequestLoggingQueue
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt
+              - RequestLoggingQueue
+              - Arn
+  RequestLoggingReaderFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: >-
+        Functions::{project_name_proper}.{project_name_proper}::{project_name_proper}Reader_Handler
+      Runtime: dotnetcore2.1
+      CodeUri: ''
+      Description: '{env}-sls-RequestLoggingReader'
+      FunctionName: '{env}-sls-RequestLoggingReader'
+      MemorySize: 512
+      Timeout: 30
+      Role: null
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - 's3:ListBucket'
+              Resource: !GetAtt
+                - RequestLoggingBucket
+                - Arn
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Join
+                - /
+                - - !GetAtt
+                    - RequestLoggingBucket
+                    - Arn
+                  - '*'
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'dynamodb:UpdateItem'
+              Resource: !Sub >-
+                arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/{ENV}_ID_US-West-2
+      Environment:
+        Variables:
+          AwsAccountNumber: !Sub '${AWS::AccountId}'
+      Tags:
+        Name: '{project_name_proper}'
+      Tracing: PassThrough
+      Events:
+        PutResource:
+          Type: Api
+          Properties:
+            Path: '/{project_name_proper}Reader/{xRefNum}'
+            Method: GET
+  RequestLoggingFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: >-
+        Functions::{project_name_proper}.{project_name_proper}::{project_name_proper}_Handler
+      Runtime: dotnetcore2.1
+      CodeUri: ''
+      Description: '{env}-sls-{project_name}'
+      FunctionName: '{env}-sls-{project_name}'
+      MemorySize: 512
+      Timeout: 30
+      Role: null
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+                - 'sqs:ReceiveMessage'
+                - 'sqs:DeleteMessage'
+                - 'sqs:GetQueueAttributes'
+              Resource:
+                - !GetAtt
+                  - RequestLoggingQueue
+                  - Arn
+                - !Join
+                  - /
+                  - - !GetAtt
+                      - RequestLoggingBucket
+                      - Arn
+                    - '*'
+      Environment:
+        Variables:
+          AwsAccountNumber: !Sub '${AWS::AccountId}'
+      Tags:
+        Name: '{project_name_proper}'
+      Tracing: PassThrough
+      Events: {}
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt
+        - RequestLoggingFunction
+        - Arn
+      Principal: sqs.amazonaws.com
+      Action: 'lambda:InvokeFunction'
+      SourceArn: !GetAtt
+        - RequestLoggingQueue
+        - Arn
+  SqsLambdaTrigger:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      FunctionName: !GetAtt
+        - RequestLoggingFunction
+        - Arn
+      BatchSize: '10'
+      Enabled: 'true'
+      EventSourceArn: !GetAtt
+        - RequestLoggingQueue
+        - Arn
+Outputs: {}
