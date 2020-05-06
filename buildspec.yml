@@ -1,0 +1,15 @@
+version: 0.2
+phases:
+    build:
+    commands:
+      - dotnet restore
+      - dotnet publish -c Release
+      - cd bin/Release/netcoreapp1.0/publish
+      - zip ../../../../MyProject.zip *
+      - cd ../../../..
+      - aws cloudformation package --template-file template.yml --s3-bucket $BUCKET --output-template-file output-template.yaml
+artifacts:
+  type: zip
+  files:
+    - template.yml
+    - output-template.yaml
